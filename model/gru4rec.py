@@ -1,16 +1,17 @@
-import argparse
+import tensorflow as tf
+import tensorflow.keras as keras
+import tensorflow.keras.backend as K
+from tensorflow.keras.models import Model
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.callbacks import ModelCheckpoint
+from tensorflow.keras.losses import categorical_crossentropy
+from tensorflow.keras.layers import Input, Dense, Dropout, GRU
+
 import numpy as np
+import argparse
 import pandas as pd
 from tqdm import tqdm
-
-import keras
-import keras.backend as K
-import tensorflow as tf
-from keras.models import Model
-from tensorflow.keras.utils import to_categorical
-from keras.callbacks import ModelCheckpoint
-from keras.losses import categorical_crossentropy
-from keras.layers import Input, Dense, Dropout, GRU
+import time
 
 
 class SessionDataset:
@@ -85,7 +86,7 @@ class SessionDataset:
 
 class SessionDataLoader:
     """Credit to yhs-968/pyGRU4REC."""
-    def __init__(self, dataset, batch_size=50):
+    def __init__(self, dataset, batch_size=50, use_correct_mask_reset=False):
         """
         A class for creating session-parallel mini-batches.
         Args:
@@ -95,6 +96,7 @@ class SessionDataLoader:
         self.dataset = dataset
         self.batch_size = batch_size
         self.done_sessions_counter = 0
+        self.use_correct_mask_reset = use_correct_mask_reset
 
     def __iter__(self):
         """ Returns the iterator for producing session-parallel training mini-batches.
@@ -130,6 +132,8 @@ class SessionDataLoader:
                 inp = idx_input
                 target = idx_target
                 yield inp, target, mask
+                if (i == 0) and self.use_correct_mask_reset:
+                    mask = []
 
             # click indices where a particular session meets second-to-last element
             start = start + (minlen - 1)
@@ -148,17 +152,18 @@ class SessionDataLoader:
 
 
 def create_model(args):
-    emb_size = 50
-    hidden_units = 100
-    size = emb_size
-
     inputs = Input(batch_shape=(args.batch_size, 1, args.train_n_items))
-    gru, gru_states = GRU(hidden_units, stateful=True, return_state=True, name="GRU")(inputs)
-    drop2 = Dropout(0.25)(gru)
+    gru, gru_states = GRU(args.hidden_size, stateful=True, return_state=True, name="GRU")(inputs)
+    drop2 = Dropout(args.dropout_p_hidden)(gru)
     predictions = Dense(args.train_n_items, activation='softmax')(drop2)
     model = Model(inputs=inputs, outputs=[predictions])
-    opt = tf.keras.optimizers.Adam(lr=0.001, beta_1=0.9, beta_2=0.999, epsilon=None, decay=0.0, amsgrad=False)
-    model.compile(loss=categorical_crossentropy, optimizer=opt)
+    if args.optim == "adam":
+        opt = tf.keras.optimizers.Adam(lr=0.001, beta_1=0.9, beta_2=0.999, epsilon=None, decay=0.0, amsgrad=False)
+    elif args.optim == "adagrad":
+        opt = tf.keras.optimizers.Adagrad(lr=args.lr, epsilon=1e-6, initial_accumulator_value=0.0)
+    else:
+        raise ValueError(f"Invalid optimizer type: {args.optim}")
+    model.compile(loss=categorical_crossentropy, optimizer=opt)#, run_eagerly=True)
     model.summary()
 
     filepath='./model_checkpoint.h5'
@@ -170,7 +175,7 @@ def create_model(args):
 def get_metrics(model, args, train_generator_map, recall_k=20, mrr_k=20):
 
     test_dataset = SessionDataset(args.test_data, itemmap=train_generator_map)
-    test_generator = SessionDataLoader(test_dataset, batch_size=args.batch_size)
+    test_generator = SessionDataLoader(test_dataset, batch_size=args.batch_size, use_correct_mask_reset=args.use_correct_mask_reset)
 
     n = 0
     rec_sum = 0
@@ -211,63 +216,67 @@ def get_metrics(model, args, train_generator_map, recall_k=20, mrr_k=20):
     mrr = mrr_sum/n
     return (recall, recall_k), (mrr, mrr_k)
 
-
 def train_model(model, args):
     train_dataset = SessionDataset(args.train_data)
     model_to_train = model
     batch_size = args.batch_size
 
-    for epoch in range(1, args.epochs):
+    for epoch in range(args.epochs):
+        epoch_start = time.time()
+        losses = []
+        events = []
         with tqdm(total=args.train_samples_qty) as pbar:
-            loader = SessionDataLoader(train_dataset, batch_size=batch_size)
+            loader = SessionDataLoader(train_dataset, batch_size=batch_size, use_correct_mask_reset=args.use_correct_mask_reset)
             for feat, target, mask in loader:
-
                 gru_layer = model_to_train.get_layer(name="GRU")
                 hidden_states = gru_layer.states[0].numpy()
                 for elt in mask:
                     hidden_states[elt, :] = 0
                 gru_layer.reset_states(states=hidden_states)
-
+                
                 input_oh = to_categorical(feat, num_classes=loader.n_items)
                 input_oh = np.expand_dims(input_oh, axis=1)
-
                 target_oh = to_categorical(target, num_classes=loader.n_items)
 
                 tr_loss = model_to_train.train_on_batch(input_oh, target_oh)
-
+                losses.append(tr_loss)  
+                events.append(len(feat))                   
                 pbar.set_description("Epoch {0}. Loss: {1:.5f}".format(epoch, tr_loss))
                 pbar.update(loader.done_sessions_counter)
 
+        epoch_duration = time.time() - epoch_start
+        print(f"epoch:{epoch} loss: {np.mean(losses):.6f} {epoch_duration:.2f} s {np.sum(events)/epoch_duration:.2f} e/s {len(events)/epoch_duration:.2f} mb/s")
         if args.save_weights:
             print("Saving weights...")
-            model_to_train.save('./GRU4REC_{}.h5'.format(epoch))
+            model_to_train.save(f"{args.save_path}/GRU4REC_{epoch}.h5")
 
         if args.eval_all_epochs:
             (rec, rec_k), (mrr, mrr_k) = get_metrics(model_to_train, args, train_dataset.itemmap)
-            print("\t - Recall@{} epoch {}: {:5f}".format(rec_k, epoch, rec))
-            print("\t - MRR@{}    epoch {}: {:5f}\n".format(mrr_k, epoch, mrr))
-
-    if not args.eval_all_epochs:
-        (rec, rec_k), (mrr, mrr_k) = get_metrics(model_to_train, args, train_dataset.itemmap)
-        print("\t - Recall@{} epoch {}: {:5f}".format(rec_k, args.epochs, rec))
-        print("\t - MRR@{}    epoch {}: {:5f}\n".format(mrr_k, args.epochs, mrr))
-
+            print("\t - Recall@{} epoch {}: {:8f}".format(rec_k, epoch, rec))
+            print("\t - MRR@{}    epoch {}: {:8f}\n".format(mrr_k, epoch, mrr))
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Keras GRU4REC: session-based recommendations')
     parser.add_argument('--resume', type=str, help='stored model path to continue training')
-    parser.add_argument('--train-path', type=str, default='../../processedData/rsc15_train_tr.txt')
-    parser.add_argument('--eval-only', type=bool, default=False)
-    parser.add_argument('--dev-path', type=str, default='../../processedData/rsc15_train_valid.txt')
-    parser.add_argument('--test-path', type=str, default='../../processedData/rsc15_test.txt')
-    parser.add_argument('--batch-size', type=str, default=512)
-    parser.add_argument('--eval-all-epochs', type=bool, default=False)
-    parser.add_argument('--save-weights', type=bool, default=False)
+    parser.add_argument('--train_path', type=str, default='../../processedData/rsc15_train_tr.txt')
+    parser.add_argument('--eval_only', type=bool, default=False)
+    parser.add_argument('--test_path', type=str, default='../../processedData/rsc15_test.txt')
+    parser.add_argument('--save_path', type=str, default='')
+    parser.add_argument('--lr', type=float, default=0.001)
+    parser.add_argument('--optim', type=str, default='adam')
+    parser.add_argument('--hidden_size', type=int, default=100)
+    parser.add_argument('--batch_size', type=int, default=512)
+    parser.add_argument('--dropout_p_hidden', type=float, default=0.0)
+    parser.add_argument('--eval_all_epochs', type=bool, default=False)
+    parser.add_argument('--save_weights', type=bool, default=True)
     parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--m', '--measure', type=int, nargs='+', default=[20])
+    parser.add_argument('--use_correct_mask_reset', default=False, action='store_true')
+
     args = parser.parse_args()
+    print(pd.DataFrame({'Args':list(args.__dict__.keys()), 'Values':list(args.__dict__.values())}))
 
     args.train_data = pd.read_csv(args.train_path, sep='\t', dtype={'ItemId': np.int64})
-    args.dev_data   = pd.read_csv(args.dev_path,   sep='\t', dtype={'ItemId': np.int64})
     args.test_data  = pd.read_csv(args.test_path,  sep='\t', dtype={'ItemId': np.int64})
 
     args.train_n_items = len(args.train_data['ItemId'].unique()) + 1
@@ -287,8 +296,8 @@ if __name__ == '__main__':
 
     if args.eval_only:
         train_dataset = SessionDataset(args.train_data)
-        (rec, rec_k), (mrr, mrr_k) = get_metrics(model, args, train_dataset.itemmap)
-        print("\t - Recall@{} epoch {}: {:5f}".format(rec_k, -1, rec))
-        print("\t - MRR@{}    epoch {}: {:5f}\n".format(mrr_k, -1, mrr))
+        for k in args.m:
+            (rec, rec_k), (mrr, mrr_k) = get_metrics(model, args, train_dataset.itemmap, recall_k=k, mrr_k=k)
+            print(f'Recall@{k}: {rec:.8} MRR@{k}: {mrr:.8}')
     else:
         train_model(model, args)
